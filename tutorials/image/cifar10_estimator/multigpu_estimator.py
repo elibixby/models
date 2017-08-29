@@ -1,7 +1,5 @@
 import six
 
-from google.protobuf import json_format
-
 import tensorflow as tf
 from tensorflow.python.client import device_lib
 from tensorflow.python.estimator.model_fn import ModeKeys
@@ -40,16 +38,17 @@ def local_device_setter(num_devices=1,
   return _local_device_chooser
 
 def _split_batch(features, labels, num_shards):
-  feature_shards = [{} for _ in num_shards]
-
   with tf.name_scope('split_inputs'):
     with tf.device('/cpu:0'):
-      for name, tensor in six.iteritems(features):
-        for i, shard in enumerate(_split_tensor(tensor, num_shards)):
-          feature_shards[i][name] = shard
+      if isinstance(features, dict):
+        feature_shards = [{} for _ in range(num_shards)]
+        for name, tensor in six.iteritems(features):
+          for i, shard in enumerate(_split_tensor(tensor, num_shards)):
+            feature_shards[i][name] = shard
+      else:
+        feature_shards = _split_tensor(features, num_shards)
 
       label_shards = _split_tensor(labels, num_shards)
-
   return feature_shards, label_shards
 
 
@@ -63,7 +62,7 @@ def _dict_concat(*dicts):
   list_dict = {}
   for d in dicts:
     for k, v in six.iteritems(d):
-      list_dict.set_default(k, []).append(v)
+      list_dict.setdefault(k, []).append(v)
   return list_dict
 
 
@@ -99,17 +98,19 @@ class TowerEstimator(tf.estimator.Estimator):
                *args,
                **kwargs):
 
-    super(self, TowerEstimator).__init__(*args, **kwargs)
+    super(TowerEstimator, self).__init__(*args, **kwargs)
 
     self._devices = {
         ModeKeys.TRAIN: _get_available_devices(train_device_type) or ['/cpu:0'],
         ModeKeys.EVAL: _get_available_devices(eval_device_type) or ['/cpu:0'],
         ModeKeys.PREDICT: predict_devices or ['/cpu:0']
     }
+    self._sync_device = sync_device
     self._optimizer_fn = optimizer_fn
     self._sync_replicas = sync_replicas
     self._tower_model_fn = self._model_fn
-    self._model_fn = self._train_model_fn
+    self._model_fn = self._wrapped_model_fn
+    self._update_from_all_towers = update_from_all_towers
     self._ps_device_type = ps_device_type.lower()
 
 
@@ -123,11 +124,12 @@ class TowerEstimator(tf.estimator.Estimator):
       with tf.variable_scope('tower_vars', reuse=bool(i != 0)):
         with tf.name_scope('tower_{}'.format(i)):
           with tf.device(device_setter):
-            tower_spec = self._tower_model_fn(mode, features, labels, params)
+            tower_spec = self._tower_model_fn(
+                mode=mode, features=features, labels=labels, params=params)
             tower_specs.append(tower_spec)
     return tower_specs
 
-  def _wrapped_model_function(self, mode, features, labels, params):
+  def _wrapped_model_fn(self, mode, features, labels, params):
     feature_shards, label_shards = _split_batch(
         features, labels, len(self._devices[mode]))
     tower_specs = self._get_towers(
@@ -138,24 +140,25 @@ class TowerEstimator(tf.estimator.Estimator):
         self._devices[mode]
     )
     if mode == ModeKeys.TRAIN:
-      return self._train_spec(tower_specs)
+      return self._train_spec(tower_specs, params=params)
     if mode == ModeKeys.EVAL:
       return self._eval_spec(tower_specs)
     if mode == ModeKeys.PREDICT:
       return self._predict_spec(tower_specs)
 
   def _get_average_loss(self, tower_specs):
-    with tf.device(self._sync_device):
-      if len(tower_specs) > 1:
+    if len(tower_specs) > 1:
+      with tf.device(self._sync_device):
         return tf.multiply(
             tf.add_n([tower_spec.loss for tower_spec in tower_specs]),
-            1 / len(tower_specs)
+            1 / len(tower_specs),
+            name='loss'
         )
-      else:
-        return tower_specs[0].loss
+    else:
+      return tf.identity(tower_specs[0].loss, name='loss')
 
   def _predict_spec(self, tower_specs):
-    old_estimator_spec = json_format.MessageToDict(tower_specs[0])
+    old_estimator_spec = tower_specs[0]._asdict()
 
     with tf.device(tf._sync_device):
       old_estimator_spec['predictions'] = _concat_tensor_dicts(
@@ -198,17 +201,17 @@ class TowerEstimator(tf.estimator.Estimator):
           export_output[name] = tf.estimator.ClassificationOutput(
               scores=scores, classes=classes)
     old_estimator_spec['export_outputs'] = export_outputs
-    return tf.estimator.EstimatorSpec(**old_estimator_spec)
+    return tf.estimator.EstimatorSpec(ModeKeys.PREDICT, **old_estimator_spec)
 
 
   def _eval_spec(self, tower_specs):
-    old_estimator_spec = json_format.MessageToDict(tower_specs[0])
+    old_estimator_spec = tower_specs[0]._asdict()
     old_estimator_spec['loss'] = self._get_average_loss(tower_specs)
     eval_metric_ops_lists = {}
     for tower_spec in tower_specs:
       metrics = tower_spec.eval_metric_ops or {}
       for name, (metric_tensor, update_op) in six.iteritems(metrics):
-        metric_lists = eval_metric_ops_lists.set_default(name, ([], []))
+        metric_lists = eval_metric_ops_lists.setdefault(name, ([], []))
         metric_lists[0].append(metric_tensor)
         metric_lists[1].append(update_op)
 
@@ -222,9 +225,9 @@ class TowerEstimator(tf.estimator.Estimator):
         )
 
     old_estimator_spec['eval_metric_ops'] = eval_metric_ops
-    return tf.estimator.EstimatorSpec(**old_estimator_spec)
+    return tf.estimator.EstimatorSpec(ModeKeys.EVAL, **old_estimator_spec)
 
-  def _train_spec(self, tower_specs):
+  def _train_spec(self, tower_specs, params):
     with tf.name_scope('tower_0') as name_scope:
       update_ops = tf.get_collection(
           tf.GraphKeys.UPDATE_OPS,
@@ -235,10 +238,10 @@ class TowerEstimator(tf.estimator.Estimator):
     for tower_spec in tower_specs:
       with tf.device(tower_spec.loss.device):
         variables = tf.trainable_variables()
-        gradients = tf.gradients(variables, tower_spec.loss)
+        gradients = tf.gradients(tower_spec.loss, variables)
         for var, grad in zip(variables, gradients):
           if grad is not None:
-            grad_lists.set_default(var, []).append(grad)
+            grad_lists.setdefault(var, []).append(grad)
 
     averaged_grads = []
     with tf.name_scope('gradient_averaging'):
@@ -251,21 +254,24 @@ class TowerEstimator(tf.estimator.Estimator):
         averaged_grads.append((avg_grad, var))
 
 
-    old_estimator_spec = json_format.MessageToDict(tower_specs[0])
+    old_estimator_spec = tower_specs[0]._asdict()
+    print(old_estimator_spec)
 
     old_estimator_spec['loss'] = self._get_average_loss(tower_specs)
     with tf.device(self._sync_device):
-      if self._sync_replicas:
+      if self._sync_replicas and self.config.num_worker_replicas:
         optimizer = tf.train.SyncReplicasOptimizer(
-            self._optimizer_fn(),
-            replicas_to_aggregate=self._run_config.num_worker_replicas
+            self._optimizer_fn(params),
+            replicas_to_aggregate=self.config.num_worker_replicas
         )
         sync_replicas_hook = optimizer.make_session_run_hook(True)
-        old_estimator_spec['training_chief_hooks'].append(sync_replicas_hook)
+        old_estimator_spec.setdefault('training_chief_hooks', []).append(sync_replicas_hook)
       else:
-        optimizer = self._optimizer_fn()
+        optimizer = self._optimizer_fn(params)
 
       with tf.control_dependencies(update_ops):
-        train_op = optimizer.apply_gradients(averaged_grads)
+        train_op = optimizer.apply_gradients(
+            averaged_grads,
+            global_step=tf.train.get_global_step())
         old_estimator_spec['train_op'] = train_op
-    return tf.estimator.EstimatorSpec(**old_estimator_spec)
+    return tf.estimator.EstimatorSpec(ModeKeys.TRAIN, **old_estimator_spec)
