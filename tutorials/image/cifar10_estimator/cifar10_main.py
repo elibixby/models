@@ -77,10 +77,10 @@ def model_fn(mode, features, labels, params):
   if isinstance(features, dict):
     features = features['feature']
 
-  if params.variable_strategy == multigpu_estimator.VariableStrategy.CPU:
-    data_format = 'channels_last'
-  else:
+  if params.use_gpus:
     data_format = 'channels_first'
+  else:
+    data_format = 'channels_last'
 
   model = cifar10_model.ResNetCifar10(
       params.num_layers,
@@ -89,7 +89,7 @@ def model_fn(mode, features, labels, params):
       is_training=bool(mode == ModeKeys.TRAIN),
       data_format=data_format)
 
-  logits = model.forward_pass(features, input_data_format='channels_first')
+  logits = model.forward_pass(features, input_data_format='channels_last')
 
   if mode in (ModeKeys.EVAL, ModeKeys.TRAIN):
     loss = tf.losses.sparse_softmax_cross_entropy(
@@ -147,9 +147,8 @@ def serving_input_fn():
     )
     resized_images = tf.image.resize_images(
         images, [cifar10.HEIGHT, cifar10.WIDTH])
-    # Reshape to [depth, height, width]
-    final_images = tf.cast(
-        tf.transpose(resized_images, [0, 3, 1, 2]), tf.float32)
+    # Reshape to channels_first data format
+    final_images = tf.cast(resized_images, tf.float32)
   return tf.estimator.export.ServingInputReceiver(
       final_images, image_bytes_batch)
 
@@ -189,6 +188,7 @@ def experiment_fn(run_config, hparams):
   if num_eval_examples % hparams.eval_batch_size != 0:
     raise ValueError('validation set size must be multiple of eval_batch_size')
 
+
   train_steps = hparams.train_steps
   eval_steps = num_eval_examples // hparams.eval_batch_size
   examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
@@ -206,6 +206,8 @@ def experiment_fn(run_config, hparams):
       model_fn=model_fn,
       variable_strategy=hparams.variable_strategy,
       optimizer_fn=optimizer_fn,
+      train_device_type='GPU' if hparams.use_gpus else 'CPU',
+      eval_device_type='GPU' if hparams.use_gpus else 'CPU',
       sync_replicas=hparams.sync,
       config=run_config,
       params=hparams)
@@ -252,6 +254,7 @@ def main(job_dir,
       experiment_fn,
       run_config=config,
       hparams=tf.contrib.training.HParams(
+          use_gpus=bool(multigpu_estimator.get_available_devices('GPU')),
           num_workers=config.num_worker_replicas or 1,
           **hparams)
   )

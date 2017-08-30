@@ -84,7 +84,7 @@ def _concat_tensor_dicts(*tensor_dicts):
       for name, tensors in six.iteritems(_dict_concat(*tensor_dicts))
   }
 
-def _get_available_devices(device_type):
+def get_available_devices(device_type):
   local_device_protos = device_lib.list_local_devices()
   return [device.name
           for device in local_device_protos
@@ -107,8 +107,8 @@ class TowerEstimator(tf.estimator.Estimator):
     super(TowerEstimator, self).__init__(*args, **kwargs)
 
     self._devices = {
-        ModeKeys.TRAIN: _get_available_devices(train_device_type) or ['/cpu:0'],
-        ModeKeys.EVAL: _get_available_devices(eval_device_type) or ['/cpu:0'],
+        ModeKeys.TRAIN: get_available_devices(train_device_type),
+        ModeKeys.EVAL: get_available_devices(eval_device_type),
         ModeKeys.PREDICT: predict_devices or ['/cpu:0']
     }
     self._sync_device = sync_device
