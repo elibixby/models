@@ -60,70 +60,98 @@ def optimizer_fn(params):
   return tf.train.MomentumOptimizer(
       learning_rate=learning_rate, momentum=params.momentum)
 
-def get_tower_fn(is_cpu):
-  def _model_fn(mode, features, labels, params):
-    """Build computation tower for each device (CPU or GPU).
+def model_fn(mode, features, labels, params):
+  """Build computation tower for each device (CPU or GPU).
 
-    Args:
-      is_training: true if is training graph.
-      weight_decay: weight regularization strength, a float.
-      feature: a Tensor.
-      label: a Tensor.
-      tower_losses: a list to be appended with current tower's loss.
-      tower_gradvars: a list to be appended with current tower's gradients.
-      tower_preds: a list to be appended with current tower's predictions.
-      is_cpu: true if build tower on CPU.
-    """
-    data_format = 'channels_last' if is_cpu else 'channels_first'
-    model = cifar10_model.ResNetCifar10(
-        params.num_layers,
-        batch_norm_decay=params.batch_norm_decay,
-        batch_norm_epsilon=params.batch_norm_epsilon,
-        is_training=bool(mode == ModeKeys.TRAIN),
-        data_format=data_format)
+  Args:
+    is_training: true if is training graph.
+    weight_decay: weight regularization strength, a float.
+    feature: a Tensor.
+    label: a Tensor.
+    tower_losses: a list to be appended with current tower's loss.
+    tower_gradvars: a list to be appended with current tower's gradients.
+    tower_preds: a list to be appended with current tower's predictions.
+    is_cpu: true if build tower on CPU.
+  """
+  # Workaround because ServingInputReceiver must pass dict
+  if isinstance(features, dict):
+    features = features['feature']
 
-    logits = model.forward_pass(features, input_data_format='channels_last')
+  if params.variable_strategy == multigpu_estimator.VariableStrategy.CPU:
+    data_format = 'channels_last'
+  else:
+    data_format = 'channels_first'
 
-    if mode in (ModeKeys.EVAL, ModeKeys.TRAIN):
-      loss = tf.losses.sparse_softmax_cross_entropy(
-          logits=logits, labels=labels)
-      loss = tf.reduce_mean(loss)
+  model = cifar10_model.ResNetCifar10(
+      params.num_layers,
+      batch_norm_decay=params.batch_norm_decay,
+      batch_norm_epsilon=params.batch_norm_epsilon,
+      is_training=bool(mode == ModeKeys.TRAIN),
+      data_format=data_format)
 
-    if mode in (ModeKeys.EVAL, ModeKeys.PREDICT):
-      predictions = {
-          'classes': tf.argmax(input=logits, axis=1),
-          'probabilities': tf.nn.softmax(logits)
-      }
-      if isinstance(features, dict) and 'keys' in features:
-        predictions['keys'] = features['keys']
+  logits = model.forward_pass(features, input_data_format='channels_first')
 
-    if mode == ModeKeys.PREDICT:
-      return tf.estimator.EstimatorSpec(
-          mode=mode,
-          predictions=predictions,
-          export_outputs=tf.estimator.export.PredictOutput(outputs=predictions))
+  if mode in (ModeKeys.EVAL, ModeKeys.TRAIN):
+    loss = tf.losses.sparse_softmax_cross_entropy(
+        logits=logits, labels=labels)
+    loss = tf.reduce_mean(loss, name='loss')
 
-    if mode == ModeKeys.EVAL:
-      labels_one_hot = tf.one_hot(
-          labels,
-          depth=predictions['probabilities'].shape[1],
-          on_value=True,
-          off_value=False,
-          dtype=tf.bool
-      )
-      metrics = {
-          'accuracy': tf.metrics.accuracy(labels, predictions['classes']),
-          'auroc': tf.metrics.auc(labels_one_hot, predictions['probabilities'])
-      }
-      return tf.estimator.EstimatorSpec(mode=mode, loss=loss, eval_metric_ops=metrics)
-    if mode == ModeKeys.TRAIN:
-      return tf.estimator.EstimatorSpec(
-          # Dummy train_op, unused by TowerEstimator
-          train_op=loss,
-          loss=loss,
-          mode=mode
-      )
-  return _model_fn
+  if mode in (ModeKeys.EVAL, ModeKeys.PREDICT):
+    predictions = {
+        'classes': tf.argmax(input=logits, axis=1),
+        'probabilities': tf.nn.softmax(logits)
+    }
+    if isinstance(features, dict) and 'keys' in features:
+      predictions['keys'] = features['keys']
+
+  if mode == ModeKeys.PREDICT:
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        predictions=predictions,
+        export_outputs={
+            'serving_default': tf.estimator.export.PredictOutput(
+                outputs=predictions)
+        }
+    )
+
+  if mode == ModeKeys.EVAL:
+    labels_one_hot = tf.one_hot(
+        labels,
+        depth=predictions['probabilities'].shape[1],
+        on_value=True,
+        off_value=False,
+        dtype=tf.bool
+    )
+    metrics = {
+        'accuracy': tf.metrics.accuracy(labels, predictions['classes']),
+        'auroc': tf.metrics.auc(labels_one_hot, predictions['probabilities'])
+    }
+    return tf.estimator.EstimatorSpec(mode=mode, loss=loss, eval_metric_ops=metrics)
+  if mode == ModeKeys.TRAIN:
+    return tf.estimator.EstimatorSpec(
+        # Dummy train_op, unused by TowerEstimator
+        train_op=loss,
+        loss=loss,
+        mode=mode
+    )
+
+
+def serving_input_fn():
+  with tf.device('/cpu:0'):
+    image_bytes_batch = tf.placeholder(shape=[None], dtype=tf.string)
+
+    images = tf.map_fn(
+        functools.partial(tf.image.decode_jpeg, channels=cifar10.DEPTH),
+        image_bytes_batch,
+        dtype=tf.uint8
+    )
+    resized_images = tf.image.resize_images(
+        images, [cifar10.HEIGHT, cifar10.WIDTH])
+    # Reshape to [depth, height, width]
+    final_images = tf.cast(
+        tf.transpose(resized_images, [0, 3, 1, 2]), tf.float32)
+  return tf.estimator.export.ServingInputReceiver(
+      final_images, image_bytes_batch)
 
 
 def input_fn(data_dir, subset, batch_size,
@@ -141,91 +169,68 @@ def input_fn(data_dir, subset, batch_size,
     dataset = cifar10.Cifar10DataSet(data_dir, subset, use_distortion)
     return dataset.make_batch(batch_size)
 
-# create experiment
-def get_experiment_fn(data_dir, is_gpu_ps,
-                      use_distortion_for_training=True,
-                      sync=True):
-  """Returns an Experiment function.
+def experiment_fn(run_config, hparams):
+  """Returns an Experiment."""
+  # Create estimator.
+  train_input_fn = functools.partial(
+      input_fn,
+      hparams.data_dir,
+      subset='train',
+      batch_size=hparams.train_batch_size,
+      use_distortion_for_training=hparams.use_distortion_for_training)
 
-  Experiments perform training on several workers in parallel,
-  in other words experiments know how to invoke train and eval in a sensible
-  fashion for distributed training. Arguments passed directly to this
-  function are not tunable, all other arguments should be passed within
-  tf.HParams, passed to the enclosed function.
+  eval_input_fn = functools.partial(
+      input_fn,
+      hparams.data_dir,
+      subset='eval',
+      batch_size=hparams.eval_batch_size)
 
-  Args:
-      data_dir: str. Location of the data for input_fns.
-      num_gpus: int. Number of GPUs on each worker.
-      is_gpu_ps: bool. If true, average gradients on GPUs.
-      use_distortion_for_training: bool. See cifar10.Cifar10DataSet.
-      sync: bool. If true synchronizes variable updates across workers.
-  Returns:
-      A function (tf.estimator.RunConfig, tf.contrib.training.HParams) ->
-      tf.contrib.learn.Experiment.
+  num_eval_examples = cifar10.Cifar10DataSet.num_examples_per_epoch('eval')
+  if num_eval_examples % hparams.eval_batch_size != 0:
+    raise ValueError('validation set size must be multiple of eval_batch_size')
 
-      Suitable for use by tf.contrib.learn.learn_runner, which will run various
-      methods on Experiment (train, evaluate) based on information
-      about the current runner in `run_config`.
-  """
-  def _experiment_fn(run_config, hparams):
-    """Returns an Experiment."""
-    # Create estimator.
-    train_input_fn = functools.partial(
-        input_fn,
-        data_dir,
-        subset='train',
-        batch_size=hparams.train_batch_size,
-        use_distortion_for_training=use_distortion_for_training)
+  train_steps = hparams.train_steps
+  eval_steps = num_eval_examples // hparams.eval_batch_size
+  examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
+    hparams.train_batch_size, every_n_steps=10)
 
-    eval_input_fn = functools.partial(
-        input_fn,
-        data_dir,
-        subset='eval',
-        batch_size=hparams.eval_batch_size)
+  tensors_to_log = {'learning_rate': 'learning_rate',
+                    'loss': 'loss'}
 
-    num_eval_examples = cifar10.Cifar10DataSet.num_examples_per_epoch('eval')
-    if num_eval_examples % hparams.eval_batch_size != 0:
-      raise ValueError('validation set size must be multiple of eval_batch_size')
+  logging_hook = tf.train.LoggingTensorHook(
+    tensors=tensors_to_log, every_n_iter=100)
 
-    train_steps = hparams.train_steps
-    eval_steps = num_eval_examples // hparams.eval_batch_size
-    examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
-      hparams.train_batch_size, every_n_steps=10)
+  hooks = [logging_hook, examples_sec_hook]
 
-    tensors_to_log = {'learning_rate': 'learning_rate',
-                      'loss': 'loss'}
+  classifier = multigpu_estimator.TowerEstimator(
+      model_fn=model_fn,
+      variable_strategy=hparams.variable_strategy,
+      optimizer_fn=optimizer_fn,
+      sync_replicas=hparams.sync,
+      config=run_config,
+      params=hparams)
 
-    logging_hook = tf.train.LoggingTensorHook(
-      tensors=tensors_to_log, every_n_iter=100)
-
-    hooks = [logging_hook, examples_sec_hook]
-
-    classifier = multigpu_estimator.TowerEstimator(
-        model_fn=get_tower_fn(is_gpu_ps),
-        optimizer_fn=optimizer_fn,
-        config=run_config,
-        params=hparams)
-
-    # Create experiment.
-    experiment = tf.contrib.learn.Experiment(
-        classifier,
-        train_input_fn=train_input_fn,
-        eval_input_fn=eval_input_fn,
-        train_steps=train_steps,
-        eval_steps=eval_steps)
-    # Adding hooks to be used by the estimator on training modes
-    experiment.extend_train_hooks(hooks)
-    return experiment
-  return _experiment_fn
+  # Create experiment.
+  experiment = tf.contrib.learn.Experiment(
+      classifier,
+      train_input_fn=train_input_fn,
+      eval_input_fn=eval_input_fn,
+      train_steps=train_steps,
+      eval_steps=eval_steps,
+      export_strategies=tf.contrib.learn.make_export_strategy(
+          serving_input_fn,
+          default_output_alternative_key=None,
+          exports_to_keep=1
+      )
+  )
+  # Adding hooks to be used by the estimator on training modes
+  experiment.extend_train_hooks(hooks)
+  return experiment
 
 
 def main(job_dir,
-         data_dir,
-         variable_strategy,
-         use_distortion_for_training,
          log_device_placement,
          num_intra_threads,
-         sync,
          **hparams):
   # The env variable is on deprecation path, default is set to off.
   os.environ['TF_SYNC_ON_FINISH'] = '0'
@@ -244,12 +249,7 @@ def main(job_dir,
       session_config=sess_config,
       model_dir=job_dir)
   tf.contrib.learn.learn_runner.run(
-      get_experiment_fn(
-          data_dir,
-          variable_strategy,
-          use_distortion_for_training,
-          sync
-      ),
+      experiment_fn,
       run_config=config,
       hparams=tf.contrib.training.HParams(
           num_workers=config.num_worker_replicas or 1,
@@ -273,9 +273,10 @@ if __name__ == '__main__':
   )
   parser.add_argument(
       '--variable-strategy',
-      choices=['CPU', 'GPU'],
+      choices=[multigpu_estimator.VariableStrategy.CPU,
+               multigpu_estimator.VariableStrategy.GPU],
       type=str,
-      default='CPU',
+      default=multigpu_estimator.VariableStrategy.CPU,
       help='Where to locate variable operations'
   )
   parser.add_argument(

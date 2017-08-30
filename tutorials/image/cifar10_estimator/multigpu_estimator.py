@@ -8,6 +8,10 @@ from tensorflow.python.framework import device as pydev
 from tensorflow.python.training import device_setter
 
 
+class VariableStrategy:
+  CPU = 'cpu'
+  GPU = 'gpu'
+
 def local_device_setter(num_devices=1,
                         ps_device_type='cpu',
                         worker_device='/cpu:0',
@@ -48,7 +52,7 @@ def _split_batch(features, labels, num_shards):
       else:
         feature_shards = _split_tensor(features, num_shards)
 
-      label_shards = _split_tensor(labels, num_shards)
+    label_shards = None if labels is None else  _split_tensor(labels, num_shards)
   return feature_shards, label_shards
 
 
@@ -61,6 +65,7 @@ def _split_tensor(tensor, num_shards):
 def _dict_concat(*dicts):
   list_dict = {}
   for d in dicts:
+    print(d)
     for k, v in six.iteritems(d):
       list_dict.setdefault(k, []).append(v)
   return list_dict
@@ -68,14 +73,15 @@ def _dict_concat(*dicts):
 
 def _avg_tensor_dicts(*tensor_dicts):
   return {
-      name: tf.reduce_mean(tf.stack(tensor_list), axis=0)
-      for name, tensor_list in six.iteritems(_dict_concat(tensor_dicts))
+      name: tf.reduce_mean(tf.stack(tensors), axis=0)
+      if len(tensors) > 1 else tensors[0]
+      for name, tensors in six.iteritems(_dict_concat(*tensor_dicts))
   }
 
 def _concat_tensor_dicts(*tensor_dicts):
   return {
-      name: tf.concat(tensors, axis=0)
-      for name, tensors in six.iteritems(_dict_concat(tensor_dicts))
+      name: tf.concat(tensors, axis=0) if len(tensors) > 1 else tensors[0]
+      for name, tensors in six.iteritems(_dict_concat(*tensor_dicts))
   }
 
 def _get_available_devices(device_type):
@@ -91,7 +97,7 @@ class TowerEstimator(tf.estimator.Estimator):
                train_device_type='GPU',
                eval_device_type='GPU',
                predict_devices=None,
-               ps_device_type='CPU',
+               variable_strategy=VariableStrategy.CPU,
                sync_device='/cpu:0',
                sync_replicas=True,
                update_from_all_towers=False,
@@ -111,31 +117,46 @@ class TowerEstimator(tf.estimator.Estimator):
     self._tower_model_fn = self._model_fn
     self._model_fn = self._wrapped_model_fn
     self._update_from_all_towers = update_from_all_towers
-    self._ps_device_type = ps_device_type.lower()
+    self._ps_device_type = variable_strategy
 
 
   def _get_towers(self, mode, features, labels, params, devices):
     tower_specs = []
-    for i, device in enumerate(devices):
+    if len(devices) > 1:
+      for i, device in enumerate(devices):
+        device_setter = local_device_setter(
+            num_devices=len(devices),
+            worker_device=device,
+            ps_device_type=self._ps_device_type)
+        with tf.variable_scope('tower_vars', reuse=bool(i != 0)):
+          with tf.name_scope('tower_{}'.format(i)):
+            with tf.device(device_setter):
+              tower_spec = self._tower_model_fn(
+                  mode=mode, features=features[i], labels=labels[i], params=params)
+              tower_specs.append(tower_spec)
+    else:  # Avoid unnecessary name scoping
       device_setter = local_device_setter(
-          num_devices=len(devices),
-          worker_device=device,
+          worker_device=devices[0],
           ps_device_type=self._ps_device_type)
-      with tf.variable_scope('tower_vars', reuse=bool(i != 0)):
-        with tf.name_scope('tower_{}'.format(i)):
-          with tf.device(device_setter):
-            tower_spec = self._tower_model_fn(
-                mode=mode, features=features, labels=labels, params=params)
-            tower_specs.append(tower_spec)
+      with tf.device(device_setter):
+        tower_spec = self._tower_model_fn(
+            mode=mode, features=features[0], labels=labels[0], params=params)
+        tower_specs.append(tower_spec)
+
     return tower_specs
 
   def _wrapped_model_fn(self, mode, features, labels, params):
-    feature_shards, label_shards = _split_batch(
-        features, labels, len(self._devices[mode]))
+    print(features)
+    if len(self._devices[mode]) > 1:
+      feature_shards, label_shards = _split_batch(
+          features, labels, len(self._devices[mode]))
+    else:
+      feature_shards, label_shards = ([features], [labels])
+    print(feature_shards)
     tower_specs = self._get_towers(
         mode,
-        features,
-        labels,
+        feature_shards,
+        label_shards,
         params,
         self._devices[mode]
     )
@@ -155,50 +176,50 @@ class TowerEstimator(tf.estimator.Estimator):
             name='loss'
         )
     else:
-      return tf.identity(tower_specs[0].loss, name='loss')
+      return tower_specs[0].loss
 
   def _predict_spec(self, tower_specs):
     old_estimator_spec = tower_specs[0]._asdict()
 
-    with tf.device(tf._sync_device):
+    with tf.device(self._sync_device):
       old_estimator_spec['predictions'] = _concat_tensor_dicts(
-          tower_spec.predictions for tower_spec in tower_specs)
+          *[tower_spec.predictions for tower_spec in tower_specs])
 
       export_output_dict = _dict_concat(
-          tower_spec.export_outputs for tower_spec in tower_specs)
+          *[tower_spec.export_outputs for tower_spec in tower_specs])
 
       export_outputs = {}
       for name, export_output_list in six.iteritems(export_output_dict):
-        if isinstance(tf.estimator.PredictOutput, export_output_list[0]):
-          export_outputs[name] = tf.estimator.PredictOutput(
+        if isinstance(export_output_list[0], tf.estimator.export.PredictOutput):
+          export_outputs[name] = tf.estimator.export.PredictOutput(
               outputs=_concat_tensor_dicts(
-                  export_output.outputs for export_output in export_output_list
+                  *[export_output.outputs for export_output in export_output_list]
               )
           )
-        elif isinstance(tf.estimator.RegressionOutput, export_output_list[0]):
-          export_output[name] = tf.estimator.RegressionOutput(
+        elif isinstance(export_output_list[0], tf.estimator.export.RegressionOutput):
+          export_output[name] = tf.estimator.export.RegressionOutput(
               value=tf.concat(
                   [export_output.value for export_output in export_output_list],
                   axis=0
-              )
+              ) if len(export_output_list) > 1 else export_output_list[0].value
           )
-        elif isinstance(tf.estimator.ClassificationOutput, export_output_list[0]):
+        elif isinstance(export_output_list[0], tf.estimator.export.ClassificationOutput):
           if export_output_list[0].scores is not None:
               scores = tf.concat(
                   [export_output.scores for export_output in export_output_list],
                   axis=0
-              )
+              ) if len(export_output_list) > 1 else export_output_list[0].scores
           else:
               scores = None
           if export_output_list[0].classes is not None:
               classes = tf.concat(
                   [export_output.classes for export_output in export_output_list],
                   axis=0
-              )
+              ) if len(export_output_list) > 1 else export_output_list[0].classes
           else:
               scores = None
 
-          export_output[name] = tf.estimator.ClassificationOutput(
+          export_output[name] = tf.estimator.export.ClassificationOutput(
               scores=scores, classes=classes)
     old_estimator_spec['export_outputs'] = export_outputs
     return tf.estimator.EstimatorSpec(ModeKeys.PREDICT, **old_estimator_spec)
