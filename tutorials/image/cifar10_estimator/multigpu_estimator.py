@@ -1,3 +1,5 @@
+from __future__ import division
+
 import six
 
 import tensorflow as tf
@@ -11,6 +13,7 @@ from tensorflow.python.training import device_setter
 class VariableStrategy:
   CPU = 'cpu'
   GPU = 'gpu'
+
 
 def local_device_setter(num_devices=1,
                         ps_device_type='cpu',
@@ -41,31 +44,27 @@ def local_device_setter(num_devices=1,
       return worker_device_spec.to_string()
   return _local_device_chooser
 
+
 def _split_batch(features, labels, num_shards):
   with tf.name_scope('split_inputs'):
     with tf.device('/cpu:0'):
       if isinstance(features, dict):
         feature_shards = [{} for _ in range(num_shards)]
         for name, tensor in six.iteritems(features):
-          for i, shard in enumerate(_split_tensor(tensor, num_shards)):
+          for i, shard in enumerate(tf.split(tensor, num_shards)):
             feature_shards[i][name] = shard
       else:
-        feature_shards = _split_tensor(features, num_shards)
-
-    label_shards = None if labels is None else  _split_tensor(labels, num_shards)
+        feature_shards = tf.split(features, num_shards)
+    if labels is None:
+      label_shards = None
+    else:
+      label_shards = tf.split(labels, num_shards)
   return feature_shards, label_shards
-
-
-def _split_tensor(tensor, num_shards):
-  batch_size = tf.shape(tensor)[0]
-  splits = tf.range(0, batch_size, delta=batch_size/num_shards)
-  return tf.split(tensor, splits, axis=0, num=num_shards)
 
 
 def _dict_concat(*dicts):
   list_dict = {}
   for d in dicts:
-    print(d)
     for k, v in six.iteritems(d):
       list_dict.setdefault(k, []).append(v)
   return list_dict
@@ -78,17 +77,20 @@ def _avg_tensor_dicts(*tensor_dicts):
       for name, tensors in six.iteritems(_dict_concat(*tensor_dicts))
   }
 
+
 def _concat_tensor_dicts(*tensor_dicts):
   return {
       name: tf.concat(tensors, axis=0) if len(tensors) > 1 else tensors[0]
       for name, tensors in six.iteritems(_dict_concat(*tensor_dicts))
   }
 
+
 def get_available_devices(device_type):
   local_device_protos = device_lib.list_local_devices()
   return [device.name
           for device in local_device_protos
           if device.device_type == device_type]
+
 
 class TowerEstimator(tf.estimator.Estimator):
 
@@ -119,40 +121,27 @@ class TowerEstimator(tf.estimator.Estimator):
     self._update_from_all_towers = update_from_all_towers
     self._ps_device_type = variable_strategy
 
-
   def _get_towers(self, mode, features, labels, params, devices):
     tower_specs = []
-    if len(devices) > 1:
-      for i, device in enumerate(devices):
-        device_setter = local_device_setter(
-            num_devices=len(devices),
-            worker_device=device,
-            ps_device_type=self._ps_device_type)
-        with tf.variable_scope('tower_vars', reuse=bool(i != 0)):
-          with tf.name_scope('tower_{}'.format(i)):
-            with tf.device(device_setter):
-              tower_spec = self._tower_model_fn(
-                  mode=mode, features=features[i], labels=labels[i], params=params)
-              tower_specs.append(tower_spec)
-    else:  # Avoid unnecessary name scoping
+    for i, device in enumerate(devices):
       device_setter = local_device_setter(
-          worker_device=devices[0],
+          num_devices=len(devices),
+          worker_device=device,
           ps_device_type=self._ps_device_type)
-      with tf.device(device_setter):
-        tower_spec = self._tower_model_fn(
-            mode=mode, features=features[0], labels=labels[0], params=params)
-        tower_specs.append(tower_spec)
-
+      with tf.variable_scope('tower_vars', reuse=bool(i != 0)):
+        with tf.name_scope('tower_{}'.format(i)):
+          with tf.device(device_setter):
+            tower_spec = self._tower_model_fn(
+                mode=mode, features=features[i], labels=labels[i], params=params)
+            tower_specs.append(tower_spec)
     return tower_specs
 
   def _wrapped_model_fn(self, mode, features, labels, params):
-    print(features)
     if len(self._devices[mode]) > 1:
       feature_shards, label_shards = _split_batch(
           features, labels, len(self._devices[mode]))
     else:
       feature_shards, label_shards = ([features], [labels])
-    print(feature_shards)
     tower_specs = self._get_towers(
         mode,
         feature_shards,
@@ -176,7 +165,7 @@ class TowerEstimator(tf.estimator.Estimator):
             name='loss'
         )
     else:
-      return tower_specs[0].loss
+      return tf.identity(tower_specs[0].loss, name='loss')
 
   def _predict_spec(self, tower_specs):
     old_estimator_spec = tower_specs[0]._asdict()
@@ -271,12 +260,11 @@ class TowerEstimator(tf.estimator.Estimator):
           if len(grads) == 1:
             avg_grad = grads[0]
           else:
-            tf.multiply(tf.add_n(grads), 1 / len(grads))
+            avg_grad = tf.multiply(tf.add_n(grads), 1 / len(grads))
         averaged_grads.append((avg_grad, var))
 
 
     old_estimator_spec = tower_specs[0]._asdict()
-    print(old_estimator_spec)
 
     old_estimator_spec['loss'] = self._get_average_loss(tower_specs)
     with tf.device(self._sync_device):

@@ -188,7 +188,6 @@ def experiment_fn(run_config, hparams):
   if num_eval_examples % hparams.eval_batch_size != 0:
     raise ValueError('validation set size must be multiple of eval_batch_size')
 
-
   train_steps = hparams.train_steps
   eval_steps = num_eval_examples // hparams.eval_batch_size
   examples_sec_hook = cifar10_utils.ExamplesPerSecondHook(
@@ -210,6 +209,7 @@ def experiment_fn(run_config, hparams):
       eval_device_type='GPU' if hparams.use_gpus else 'CPU',
       sync_replicas=hparams.sync,
       config=run_config,
+      predict_devices=['/gpu:0' if hparams.use_gpus else '/cpu:0'],
       params=hparams)
 
   # Create experiment.
@@ -287,6 +287,12 @@ if __name__ == '__main__':
       type=int,
       default=44,
       help='The number of layers of the model.'
+  )
+  parser.add_argument(
+      '--predict-device',
+      type=str,
+      default='/gpu:0',
+      help='Device to pin ops to in the exported model'
   )
   parser.add_argument(
       '--train-steps',
