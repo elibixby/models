@@ -95,6 +95,7 @@ def get_available_devices(device_type):
 class TowerEstimator(tf.estimator.Estimator):
 
   def __init__(self,
+               model_fn,
                optimizer_fn,
                train_device_type='GPU',
                eval_device_type='GPU',
@@ -106,8 +107,6 @@ class TowerEstimator(tf.estimator.Estimator):
                *args,
                **kwargs):
 
-    super(TowerEstimator, self).__init__(*args, **kwargs)
-
     self._devices = {
         ModeKeys.TRAIN: get_available_devices(train_device_type),
         ModeKeys.EVAL: get_available_devices(eval_device_type),
@@ -116,10 +115,11 @@ class TowerEstimator(tf.estimator.Estimator):
     self._sync_device = sync_device
     self._optimizer_fn = optimizer_fn
     self._sync_replicas = sync_replicas
-    self._tower_model_fn = self._model_fn
-    self._model_fn = self._wrapped_model_fn
+    self._tower_model_fn = model_fn
     self._update_from_all_towers = update_from_all_towers
     self._ps_device_type = variable_strategy
+
+    super(TowerEstimator, self).__init__(model_fn=self._wrapped_model_fn, *args, **kwargs)
 
   def _get_towers(self, mode, features, labels, params, devices):
     tower_specs = []
@@ -269,12 +269,21 @@ class TowerEstimator(tf.estimator.Estimator):
     old_estimator_spec['loss'] = self._get_average_loss(tower_specs)
     with tf.device(self._sync_device):
       if self._sync_replicas and self.config.num_worker_replicas:
+        # Master is not local
+        if self.config.master:
+           num_workers = self.config.num_worker_replicas + 1
+        else:
+           num_workers = self.config.num_worker_replicas
         optimizer = tf.train.SyncReplicasOptimizer(
             self._optimizer_fn(params),
-            replicas_to_aggregate=self.config.num_worker_replicas
+            replicas_to_aggregate=num_workers
         )
-        sync_replicas_hook = optimizer.make_session_run_hook(True)
-        old_estimator_spec.setdefault('training_chief_hooks', []).append(sync_replicas_hook)
+        tf.logging.info(self.config)
+        sync_replicas_hook = optimizer.make_session_run_hook(
+            self.config.is_chief)
+        old_hooks = old_estimator_spec.get('training_hooks', ())
+        old_estimator_spec['training_hooks'] = list(old_hooks).append(
+            sync_replicas_hook)
       else:
         optimizer = self._optimizer_fn(params)
 
@@ -282,5 +291,10 @@ class TowerEstimator(tf.estimator.Estimator):
         train_op = optimizer.apply_gradients(
             averaged_grads,
             global_step=tf.train.get_global_step())
+
+        if self._sync_replicas and self.config.num_worker_replicas:
+          optimizer.ready_for_local_init_op.mark_used()
+
         old_estimator_spec['train_op'] = train_op
+    print(old_estimator_spec)
     return tf.estimator.EstimatorSpec(ModeKeys.TRAIN, **old_estimator_spec)
